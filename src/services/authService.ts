@@ -1,11 +1,13 @@
 import { AuthResponse, LoginAuditLog, LoginCredentials, UserProfile } from '../types/auth';
-import { ApiError, request, USE_MOCK_AUTH } from './api';
-import { MOCK_ACCOUNTS } from './mockAuthData';
+import { ApiError } from './api';
+import { auth, db } from './firebase';
+import { signInWithEmailAndPassword, signOut } from 'firebase/auth';
+import { doc, getDoc } from 'firebase/firestore';
 
 const AUDIT_LOGS_KEY = 'swasthya_audit_logs';
 
 /**
- * Service to record authentication audit logs (stub for SIH demo / backend integration)
+ * Service to record authentication audit logs (stub for backend integration)
  */
 export function recordAuditLog(log: Omit<LoginAuditLog, 'timestamp'>): void {
   try {
@@ -16,7 +18,7 @@ export function recordAuditLog(log: Omit<LoginAuditLog, 'timestamp'>): void {
     };
     existing.unshift(newLog);
     sessionStorage.setItem(AUDIT_LOGS_KEY, JSON.stringify(existing.slice(0, 50)));
-    // Also log in dev console for prototype visibility
+    // Also log in dev console for visibility
     if (import.meta.env.DEV) {
       console.info('[SwasthyaSetu Audit]', newLog);
     }
@@ -26,126 +28,132 @@ export function recordAuditLog(log: Omit<LoginAuditLog, 'timestamp'>): void {
 }
 
 /**
- * Main Authentication Service
+ * Main Authentication Service using Firebase
  */
 export const authService = {
   /**
-   * Authenticate user against selected healthcare portal
+   * Authenticate user against Firebase Auth and verify details in Firestore
    */
   async login(credentials: LoginCredentials): Promise<AuthResponse> {
     const { identifier, password, facilityCode, portal } = credentials;
 
-    // Use mock auth simulation in prototype mode
-    if (USE_MOCK_AUTH) {
-      // Simulate network latency (400ms - 800ms) for realistic UX
-      await new Promise((resolve) => setTimeout(resolve, 600));
+    try {
+      // 1. Firebase Authentication
+      const userCredential = await signInWithEmailAndPassword(auth, identifier, password);
+      const firebaseUser = userCredential.user;
 
-      // Sanitize inputs
-      const cleanId = identifier.trim();
-      const cleanCode = facilityCode.trim().toUpperCase();
+      // 2. Verify Role and Facility in Firestore
+      const userDocRef = doc(db, 'users', firebaseUser.uid);
+      const userDocSnap = await getDoc(userDocRef);
 
-      // Find matching mock account
-      const matchedAccount = MOCK_ACCOUNTS.find(
-        (acc) => acc.identifier.toUpperCase() === cleanId.toUpperCase()
-      );
-
-      if (!matchedAccount) {
-        recordAuditLog({
-          portal,
-          identifier: cleanId,
-          facilityCode: cleanCode,
-          status: 'FAILED'
-        });
-        throw new ApiError('Invalid identification credentials or facility code.', 401);
+      if (!userDocSnap.exists()) {
+        await signOut(auth);
+        recordAuditLog({ portal, identifier, facilityCode, status: 'FAILED' });
+        throw new ApiError('User profile not found in database.', 404);
       }
 
-      // Check portal role authorization (Backend role verification simulation)
-      if (matchedAccount.portal !== portal) {
-        recordAuditLog({
-          portal,
-          identifier: cleanId,
-          facilityCode: cleanCode,
-          status: 'FAILED'
-        });
+      const userData = userDocSnap.data();
+
+      // Verify active status
+      if (userData.active === false || userData.isActive === false) {
+        await signOut(auth);
+        recordAuditLog({ portal, identifier, facilityCode, status: 'FAILED' });
+        throw new ApiError('Account is deactivated. Please contact administration.', 403);
+      }
+
+      const normalizePortal = (p: string = '') => {
+        const cleaned = p.trim().toUpperCase();
+        if (cleaned === 'DOCTOR' || cleaned === 'HOSPITAL') return 'hospital';
+        if (cleaned === 'LAB_TECH' || cleaned === 'LAB' || cleaned === 'LABORATORY') return 'laboratory';
+        if (cleaned === 'PHARMACIST' || cleaned === 'PHARMACY') return 'pharmacy';
+        if (cleaned === 'STATE_ADMIN' || cleaned === 'ADMIN') return 'admin';
+        return cleaned.toLowerCase();
+      };
+
+      const userRoleRaw = userData.role || userData.portal || '';
+      const userPortalNorm = normalizePortal(userRoleRaw);
+      const reqPortalNorm = normalizePortal(portal);
+
+      // Verify portal authorization
+      if (userPortalNorm !== reqPortalNorm) {
+        await signOut(auth);
+        recordAuditLog({ portal, identifier, facilityCode, status: 'FAILED' });
         throw new ApiError(
-          `Access Denied: Account is authorized for ${matchedAccount.portal.toUpperCase()} portal, not ${portal.toUpperCase()}.`,
+          `Access Denied: Account is authorized for ${userRoleRaw.toUpperCase()} portal, not ${portal.toUpperCase()}.`,
           403,
           'ROLE_MISMATCH'
         );
       }
 
-      // Check facility code
-      if (matchedAccount.facilityCode.toUpperCase() !== cleanCode) {
-        recordAuditLog({
-          portal,
-          identifier: cleanId,
-          facilityCode: cleanCode,
-          status: 'FAILED'
-        });
-        throw new ApiError('Invalid facility or department code for this account.', 401);
-      }
+      // Verify facility code
+      const rawUserFacility = 
+        userData.facilityCode || 
+        userData.facilityId ||
+        userData.code || 
+        userData.storeCode || 
+        userData.deptCode || 
+        '';
 
-      // Check password
-      if (matchedAccount.password !== password) {
-        recordAuditLog({
-          portal,
-          identifier: cleanId,
-          facilityCode: cleanCode,
-          status: 'FAILED'
-        });
-        throw new ApiError('Invalid password. Please check your credentials.', 401);
+      const cleanCode = (s: string) => s.replace(/[\s\-_]/g, '').toUpperCase();
+      const userFacility = cleanCode(rawUserFacility);
+      const inputFacility = cleanCode(facilityCode);
+
+      if (userFacility && inputFacility && userFacility !== inputFacility) {
+        await signOut(auth);
+        recordAuditLog({ portal, identifier, facilityCode, status: 'FAILED' });
+        throw new ApiError(`Invalid facility or department code. Registered: "${rawUserFacility}"`, 401);
       }
 
       // Login success
       recordAuditLog({
         portal,
-        identifier: cleanId,
-        facilityCode: cleanCode,
+        identifier,
+        facilityCode,
         status: 'SUCCESS'
       });
 
+      const token = await firebaseUser.getIdToken();
+
+      const resolvedFacility = rawUserFacility || facilityCode.trim().toUpperCase();
+
       const userProfile: UserProfile = {
-        ...matchedAccount.profile,
+        id: firebaseUser.uid,
+        uid: firebaseUser.uid,
+        name: userData.displayName || userData.name || firebaseUser.email?.split('@')[0] || 'User',
+        displayName: userData.displayName || userData.name,
+        email: firebaseUser.email || userData.email || '',
+        role: reqPortalNorm as any,
+        systemRole: (userRoleRaw.toUpperCase() as any),
+        roleTitle: userData.roleTitle || userData.displayName || 'Authorized Officer',
+        facilityId: resolvedFacility,
+        facilityCode: resolvedFacility,
+        facilityName: userData.facilityName || `${resolvedFacility} Facility`,
+        district: userData.district || 'Maharashtra',
+        state: userData.state || 'Maharashtra',
+        permissions: userData.permissions || ['READ', 'WRITE'],
         lastLoginAt: new Date().toISOString()
       };
 
       return {
         success: true,
         user: userProfile,
-        token: 'mock_jwt_session_' + Date.now(),
-        expiresIn: 1800, // 30 minutes in seconds
+        token,
+        expiresIn: 3600,
         message: 'Authentication successful'
       };
-    }
-
-    // Production / Real Backend Endpoint: POST /api/auth/login
-    try {
-      const response = await request<AuthResponse>('/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({
-          identifier: identifier.trim(),
-          password,
-          facilityCode: facilityCode.trim(),
-          portal
-        })
-      });
-
+    } catch (err: any) {
       recordAuditLog({
         portal,
-        identifier: identifier.trim(),
-        facilityCode: facilityCode.trim(),
-        status: 'SUCCESS'
-      });
-
-      return response;
-    } catch (err: unknown) {
-      recordAuditLog({
-        portal,
-        identifier: identifier.trim(),
-        facilityCode: facilityCode.trim(),
+        identifier,
+        facilityCode,
         status: 'FAILED'
       });
-      throw err;
+
+      if (err.code === 'auth/invalid-credential' || err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') {
+        throw new ApiError('Invalid email or password. Please check your credentials.', 401);
+      }
+
+      throw err instanceof ApiError ? err : new ApiError(err.message || 'Login failed', 500);
     }
   },
 
@@ -153,14 +161,10 @@ export const authService = {
    * Log out current session
    */
   async logout(): Promise<void> {
-    if (USE_MOCK_AUTH) {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      return;
-    }
     try {
-      await request('/auth/logout', { method: 'POST' });
-    } catch {
-      // Ignore network errors on logout
+      await signOut(auth);
+    } catch (err) {
+      console.error('Firebase logout failed:', err);
     }
   },
 
@@ -168,13 +172,42 @@ export const authService = {
    * Check active session
    */
   async getSession(): Promise<UserProfile | null> {
-    if (USE_MOCK_AUTH) {
-      // Handled via AuthContext state / session store
-      return null;
-    }
+    const firebaseUser = auth.currentUser;
+    if (!firebaseUser) return null;
+
     try {
-      const response = await request<{ user: UserProfile }>('/auth/me');
-      return response.user;
+      const userDocRef = doc(db, 'users', firebaseUser.uid);
+      const userDocSnap = await getDoc(userDocRef);
+
+      if (userDocSnap.exists()) {
+        const userData = userDocSnap.data();
+        const userRoleRaw = userData.role || userData.portal || '';
+        const cleaned = userRoleRaw.trim().toUpperCase();
+        let role = 'hospital';
+        if (cleaned === 'DOCTOR' || cleaned === 'HOSPITAL') role = 'hospital';
+        else if (cleaned === 'LAB_TECH' || cleaned === 'LAB' || cleaned === 'LABORATORY') role = 'laboratory';
+        else if (cleaned === 'PHARMACIST' || cleaned === 'PHARMACY') role = 'pharmacy';
+        else if (cleaned === 'STATE_ADMIN' || cleaned === 'ADMIN') role = 'admin';
+
+        const rawUserFacility = userData.facilityCode || userData.facilityId || '';
+
+        return {
+          id: firebaseUser.uid,
+          uid: firebaseUser.uid,
+          name: userData.displayName || userData.name || firebaseUser.email?.split('@')[0] || 'User',
+          displayName: userData.displayName || userData.name,
+          email: firebaseUser.email || '',
+          role: role as any,
+          facilityId: rawUserFacility,
+          facilityCode: rawUserFacility,
+          facilityName: userData.facilityName || 'Facility',
+          district: userData.district || 'Maharashtra',
+          state: userData.state || 'Maharashtra',
+          permissions: userData.permissions || ['READ', 'WRITE'],
+          lastLoginAt: new Date().toISOString()
+        };
+      }
+      return null;
     } catch {
       return null;
     }
